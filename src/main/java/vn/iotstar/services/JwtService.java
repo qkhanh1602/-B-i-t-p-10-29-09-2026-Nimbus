@@ -1,14 +1,20 @@
 package vn.iotstar.services;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
+import com.nimbusds.jose.JOSEException;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.JWSSigner;
+import com.nimbusds.jose.JWSVerifier;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jose.crypto.MACVerifier;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
+import java.text.ParseException;
+import java.util.Base64;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
@@ -24,11 +30,11 @@ public class JwtService {
     private long jwtExpiration;
 
     public String extractUsername(String token) {
-        return extractClaim(token, Claims::getSubject);
+        return extractClaim(token, JWTClaimsSet::getSubject);
     }
 
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        final Claims claims = extractAllClaims(token);
+    public <T> T extractClaim(String token, Function<JWTClaimsSet, T> claimsResolver) {
+        final JWTClaimsSet claims = extractAllClaims(token);
         return claimsResolver.apply(claims);
     }
 
@@ -49,39 +55,73 @@ public class JwtService {
             UserDetails userDetails,
             long expiration
     ) {
-        return Jwts.builder()
-                .claims(extraClaims)
-                .subject(userDetails.getUsername())
-                .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + expiration))
-                .signWith(getSignInKey(), Jwts.SIG.HS256)
-                .compact();
+        try {
+            JWSHeader header = new JWSHeader(JWSAlgorithm.HS256);
+
+            JWTClaimsSet.Builder claimsSetBuilder = new JWTClaimsSet.Builder()
+                    .subject(userDetails.getUsername())
+                    .issueTime(new Date(System.currentTimeMillis()))
+                    .expirationTime(new Date(System.currentTimeMillis() + expiration));
+
+            if (extraClaims != null) {
+                extraClaims.forEach(claimsSetBuilder::claim);
+            }
+
+            JWTClaimsSet claimsSet = claimsSetBuilder.build();
+            SignedJWT signedJWT = new SignedJWT(header, claimsSet);
+
+            JWSSigner signer = new MACSigner(getSigningKey());
+            signedJWT.sign(signer);
+
+            return signedJWT.serialize();
+        } catch (JOSEException e) {
+            throw new RuntimeException("Error signing JWT with Nimbus: " + e.getMessage(), e);
+        }
     }
 
     public boolean isTokenValid(String token, UserDetails userDetails) {
-        final String username = extractUsername(token);
-        return (username.equals(userDetails.getUsername())) && !isTokenExpired(token);
+        try {
+            SignedJWT signedJWT = SignedJWT.parse(token);
+            JWSVerifier verifier = new MACVerifier(getSigningKey());
+            if (!signedJWT.verify(verifier)) {
+                return false;
+            }
+            final String username = signedJWT.getJWTClaimsSet().getSubject();
+            return (username != null && username.equals(userDetails.getUsername())) && !isTokenExpired(token);
+        } catch (ParseException | JOSEException e) {
+            return false;
+        }
     }
 
     private boolean isTokenExpired(String token) {
-        return extractExpiration(token).before(new Date());
+        Date expiration = extractExpiration(token);
+        return expiration != null && expiration.before(new Date());
     }
 
     private Date extractExpiration(String token) {
-        return extractClaim(token, Claims::getExpiration);
+        return extractClaim(token, JWTClaimsSet::getExpirationTime);
     }
 
-    private Claims extractAllClaims(String token) {
-        return Jwts
-                .parser()
-                .verifyWith(getSignInKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
+    private JWTClaimsSet extractAllClaims(String token) {
+        try {
+            SignedJWT signedJWT = SignedJWT.parse(token);
+            JWSVerifier verifier = new MACVerifier(getSigningKey());
+            if (!signedJWT.verify(verifier)) {
+                throw new JOSEException("The JWT signature is invalid");
+            }
+            Date expiration = signedJWT.getJWTClaimsSet().getExpirationTime();
+            if (expiration != null && expiration.before(new Date())) {
+                throw new RuntimeException("The JWT token has expired");
+            }
+            return signedJWT.getJWTClaimsSet();
+        } catch (ParseException e) {
+            throw new RuntimeException("Invalid compact JWT string: " + e.getMessage(), e);
+        } catch (JOSEException e) {
+            throw new RuntimeException(e.getMessage(), e);
+        }
     }
 
-    private SecretKey getSignInKey() {
-        byte[] keyBytes = Decoders.BASE64.decode(secretKey);
-        return Keys.hmacShaKeyFor(keyBytes);
+    private byte[] getSigningKey() {
+        return Base64.getDecoder().decode(secretKey);
     }
 }
